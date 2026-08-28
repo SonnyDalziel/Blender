@@ -2,25 +2,64 @@
 """
 zraw_to_rec709.py
 
-DaVinci Resolve Studio 20 script that finds Z CAM ZRAW clips in the current
-project's Media Pool and corrects their RAW decode settings so they are
-interpreted as Rec.709 instead of the camera-native ZRAW colour space/gamma
-(ZRAW Wide Gamut / ZLog2, depending on camera and firmware).
+DaVinci Resolve Studio 20 script that normalises Z CAM ZRAW footage to
+Rec.709 using a real Color Space Transform (CST) node in the Color page --
+NOT by rewriting RAW decode metadata on the clip or file.
 
-WHAT IT DOES
-------------
-For every clip recognised as Z CAM ZRAW (by camera metadata, codec name or
-file extension) it:
-  1. Switches the clip's RAW decode source to "Clip" so a per-clip override
-     is honoured instead of the project-wide Camera RAW setting.
-  2. Sets the RAW decode "Color Space" and "Gamma" to Rec.709.
+This is fully non-destructive:
+  * The original ZRAW media file on disk is never touched.
+  * The Media Pool clip's RAW decode settings (Camera Raw tab / Color Space
+    / Gamma properties) are left exactly as they are.
+  * The only thing that changes is the per-timeline-instance node graph in
+    the Color page: a Color Space Transform node (Input: Z CAM's native
+    space, Output: Rec.709) is inserted, exactly as if you had built it by
+    hand with the CST OFX. It shows up as a normal, clickable, editable node
+    -- you can tweak it, disable it, or delete it per clip like any other
+    grade.
 
-It does NOT touch grades, LUTs, or Resolve Color Management (RCM) input
-colour space tags -- it only corrects the raw debayer so the clip's baseband
-image is already Rec.709 straight off the sensor data, which is the fix
-requested for ZRAW footage that comes in looking flat/log or off-colour
-because it was decoded with the camera-native colour space instead of
-Rec.709.
+WHY A TWO-STEP WORKFLOW
+------------------------
+The Resolve scripting API does not expose "add a Color Space Transform OFX
+to this node" as a callable. What it DOES expose is
+TimelineItem.ApplyGradeFromDRX(), which applies a previously saved grade
+(a .drx file) onto a timeline clip's node graph. So the workflow is:
+
+  STEP 1 (one-time, done by hand in Resolve):
+    1. Put one Z CAM ZRAW clip on a timeline and open the Color page.
+    2. On Node 1, add a Color Space Transform (Effects Library > OpenFX >
+       ResolveFX Color > Color Space Transform, or right-click the node >
+       Add Node > ... in older versions it's under the same OFX list).
+    3. Set the CST's:
+         Input Color Space / Gamma  -> whatever entry matches your camera,
+                                        e.g. "Z CAM ZRAW Wide Gamut" /
+                                        "Z Log2" (check the exact wording
+                                        in the dropdown against the "Color
+                                        Space" / "Gamma" fields shown in
+                                        that clip's Camera Raw tab under
+                                        Clip Attributes, so the CST input
+                                        matches how the clip is actually
+                                        being decoded).
+         Output Color Space / Gamma -> "Rec.709" / "Rec.709" (or "Rec.709
+                                        Gamma 2.4", matching your timeline
+                                        colour space).
+    4. With that clip selected, grab a still (right-click the thumbnail
+       timeline at the top of the Color page > "Grab Still", or press the
+       grab-still button). This adds a still to the Gallery.
+    5. In the Gallery, right-click that still > Export... and save it as a
+       .drx file somewhere on disk, e.g. ~/zraw_to_rec709.drx.
+
+  STEP 2 (this script, repeatable):
+    Run this script with --drx pointing at that .drx file. It walks the
+    current timeline (or every timeline with --all-timelines), finds every
+    clip whose source media is Z CAM ZRAW, and calls
+    ApplyGradeFromDRX() on each one -- so every ZRAW clip gets the same CST
+    node graph applied, in one pass, without you dragging a PowerGrade onto
+    each clip by hand.
+
+NOTE: ApplyGradeFromDRX() applies the *entire* saved node graph from the
+.drx, replacing whatever grade is currently on that clip instance. Run this
+early in your workflow (before secondary grading), or keep the source .drx
+to just the single CST node so there's nothing else to clobber.
 
 INSTALLATION
 ------------
@@ -31,27 +70,22 @@ Workspace > Scripts:
   Windows: %APPDATA%\\Blackmagic Design\\DaVinci Resolve\\Support\\Fusion\\Scripts\\Utility\\
   Linux:   ~/.local/share/DaVinciResolve/Fusion/Scripts/Utility/
 
-Then, with your project open in Resolve, run it from
-Workspace > Scripts > zraw_to_rec709.
-
-It also runs fine as a standalone external script (python3 zraw_to_rec709.py)
-as long as Resolve is open and "External scripting using" is enabled in
-Resolve > Preferences > System > General.
+Then run it from Workspace > Scripts > zraw_to_rec709, or as an external
+script (python3 zraw_to_rec709.py --drx /path/to/grade.drx) with Resolve
+open and External Scripting enabled (Preferences > System > General).
 
 USAGE
 -----
-  python3 zraw_to_rec709.py                 # scan whole media pool, apply fix
-  python3 zraw_to_rec709.py --dry-run        # report only, change nothing
-  python3 zraw_to_rec709.py --gamma "Rec.709 Gamma 2.4"
-  python3 zraw_to_rec709.py --debug          # dump clip properties for the
-                                              # first ZRAW clip found, to help
-                                              # adjust property names/values
-                                              # for your Resolve version if
-                                              # the defaults below don't match
+  python3 zraw_to_rec709.py --drx ~/zraw_to_rec709.drx
+  python3 zraw_to_rec709.py --drx ~/zraw_to_rec709.drx --dry-run
+  python3 zraw_to_rec709.py --drx ~/zraw_to_rec709.drx --all-timelines
+  python3 zraw_to_rec709.py --drx ~/zraw_to_rec709.drx --grade-mode source-tc
 """
 
 import argparse
+import os
 import sys
+
 
 # ---------------------------------------------------------------------------
 # Connect to Resolve, whether we're running inside Resolve (Workspace >
@@ -60,8 +94,7 @@ import sys
 # ---------------------------------------------------------------------------
 def get_resolve():
     try:
-        # Running from inside Resolve's Scripts menu.
-        return resolve  # noqa: F821
+        return resolve  # noqa: F821  (injected by Resolve when run as a menu script)
     except NameError:
         pass
 
@@ -83,26 +116,26 @@ def get_resolve():
         ) from exc
 
 
-# Candidate camera-raw decode settings. Resolve's exact accepted strings for
-# the "Color Space" / "Gamma" RAW decode dropdowns have shifted slightly
-# across versions, so each target is tried as a list of fallbacks; the first
-# one SetClipProperty() actually accepts (verified by reading it back) wins.
-REC709_COLOR_SPACE_CANDIDATES = ["Rec.709", "Rec709", "Rec 709", "REC709"]
-REC709_GAMMA_CANDIDATES = ["Rec.709", "Rec709", "Rec 709", "REC709"]
+# gradeMode values accepted by TimelineItem.ApplyGradeFromDRX()
+GRADE_MODES = {
+    "no-keyframes": 0,
+    "source-tc": 1,
+    "start-frames": 2,
+}
 
-# Property names used to recognise a Z CAM ZRAW clip. Different Resolve
-# versions/camera firmwares populate slightly different metadata fields, so
-# every clip is checked against all of them.
 ZRAW_EXTENSIONS = (".zraw",)
 ZRAW_MARKERS = ("zraw", "z-raw", "z cam", "zcam")
 
 
-def is_zraw_clip(clip):
-    """Best-effort detection of a Z CAM ZRAW media pool clip."""
+def is_zraw_clip(media_pool_item):
+    """Best-effort, read-only detection of a Z CAM ZRAW source clip.
+    Only reads clip properties -- never writes anything."""
+    if media_pool_item is None:
+        return False
     props_to_check = ["Camera Type", "Codec", "Format", "File Name", "Clip Name"]
     for prop in props_to_check:
         try:
-            value = clip.GetClipProperty(prop)
+            value = media_pool_item.GetClipProperty(prop)
         except Exception:
             continue
         if not value:
@@ -115,77 +148,53 @@ def is_zraw_clip(clip):
     return False
 
 
-def set_property_with_fallback(clip, prop_name, candidates):
-    """Try each candidate value for prop_name until GetClipProperty confirms
-    it stuck. Returns the value that was actually applied, or None."""
-    for value in candidates:
-        try:
-            clip.SetClipProperty(prop_name, value)
-        except Exception:
-            continue
-        applied = None
-        try:
-            applied = clip.GetClipProperty(prop_name)
-        except Exception:
-            pass
-        if applied and str(applied).strip().lower() == value.strip().lower():
-            return applied
-    # Some Resolve builds don't echo back an exact string match even though
-    # the set succeeded (e.g. it stores "Rec.709 Gamma 2.4" after being sent
-    # "Rec.709"). Re-read once more and accept whatever is there now if it
-    # at least contains "709".
-    try:
-        applied = clip.GetClipProperty(prop_name)
-        if applied and "709" in str(applied):
-            return applied
-    except Exception:
-        pass
-    return None
+def iter_video_timeline_items(timeline):
+    """Yield every video-track TimelineItem on a timeline."""
+    track_count = timeline.GetTrackCount("video")
+    for track_index in range(1, track_count + 1):
+        for item in timeline.GetItemListInTrack("video", track_index):
+            yield item
 
 
-def walk_clips(folder, clips=None):
-    """Recursively collect every MediaPoolItem under a Media Pool folder."""
-    if clips is None:
-        clips = []
-    clips.extend(folder.GetClipList())
-    for sub_folder in folder.GetSubFolderList():
-        walk_clips(sub_folder, clips)
-    return clips
-
-
-def dump_clip_properties(clip):
-    print("\n--- Clip property dump (for adjusting this script) ---")
-    try:
-        props = clip.GetClipProperty()
-        for key in sorted(props.keys()):
-            print(f"  {key!r}: {props[key]!r}")
-    except Exception as exc:
-        print(f"  Could not enumerate properties: {exc}")
-    print("--- end dump ---\n")
+def get_timelines(project, all_timelines):
+    if all_timelines:
+        count = project.GetTimelineCount()
+        timelines = [project.GetTimelineByIndex(i) for i in range(1, count + 1)]
+        return [t for t in timelines if t is not None]
+    current = project.GetCurrentTimeline()
+    if current is None:
+        return []
+    return [current]
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--color-space", default=None,
-        help="Override the target RAW decode Color Space value (default: try Rec.709 variants).",
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--gamma", default=None,
-        help="Override the target RAW decode Gamma value (default: try Rec.709 variants).",
+        "--drx", required=True,
+        help="Path to the .drx grade (Node 1 = Color Space Transform to Rec.709) "
+             "exported from the Gallery, per the STEP 1 instructions above.",
+    )
+    parser.add_argument(
+        "--all-timelines", action="store_true",
+        help="Apply to every timeline in the project instead of just the current one.",
+    )
+    parser.add_argument(
+        "--grade-mode", choices=sorted(GRADE_MODES), default="no-keyframes",
+        help="Alignment mode passed to ApplyGradeFromDRX (default: no-keyframes).",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Report which clips would be changed without changing anything.",
-    )
-    parser.add_argument(
-        "--debug", action="store_true",
-        help="Print all clip properties for the first ZRAW clip found, then continue.",
+        help="Report which timeline clips would be graded without changing anything.",
     )
     args = parser.parse_args()
 
-    color_space_candidates = [args.color_space] if args.color_space else REC709_COLOR_SPACE_CANDIDATES
-    gamma_candidates = [args.gamma] if args.gamma else REC709_GAMMA_CANDIDATES
+    drx_path = os.path.abspath(os.path.expanduser(args.drx))
+    if not os.path.isfile(drx_path):
+        print(f"ERROR: .drx file not found: {drx_path}")
+        print("Complete STEP 1 in this script's docstring first, or check --drx.")
+        sys.exit(1)
 
     resolve = get_resolve()
     project_manager = resolve.GetProjectManager()
@@ -194,81 +203,62 @@ def main():
         print("No project is currently open in Resolve. Open a project and try again.")
         sys.exit(1)
 
-    media_pool = project.GetMediaPool()
-    root_folder = media_pool.GetRootFolder()
-    all_clips = walk_clips(root_folder)
+    timelines = get_timelines(project, args.all_timelines)
+    if not timelines:
+        print("No timeline found (open/create a timeline with your ZRAW clips cut in).")
+        sys.exit(1)
 
-    print(f"Scanned {len(all_clips)} clip(s) in project '{project.GetName()}'.")
+    grade_mode = GRADE_MODES[args.grade_mode]
 
-    zraw_clips = [c for c in all_clips if is_zraw_clip(c)]
-    print(f"Found {len(zraw_clips)} Z CAM ZRAW clip(s).")
+    total_items = 0
+    zraw_items = 0
+    applied = 0
+    failed = 0
 
-    if not zraw_clips:
-        print("Nothing to do.")
-        return
+    for timeline in timelines:
+        print(f"Timeline: {timeline.GetName()}")
+        for item in iter_video_timeline_items(timeline):
+            total_items += 1
+            media_pool_item = item.GetMediaPoolItem()
+            if not is_zraw_clip(media_pool_item):
+                continue
 
-    if args.debug:
-        dump_clip_properties(zraw_clips[0])
+            zraw_items += 1
+            clip_name = item.GetName()
 
-    updated, skipped, failed = 0, 0, 0
+            if args.dry_run:
+                print(f"  [would apply CST] {clip_name}")
+                continue
 
-    for clip in zraw_clips:
-        name = clip.GetClipProperty("Clip Name") or clip.GetName()
+            try:
+                ok = item.ApplyGradeFromDRX(drx_path, grade_mode)
+            except Exception as exc:
+                print(f"  [FAILED] {clip_name}: exception applying grade ({exc})")
+                failed += 1
+                continue
 
-        current_color_space = None
-        current_gamma = None
-        try:
-            current_color_space = clip.GetClipProperty("Color Space")
-            current_gamma = clip.GetClipProperty("Gamma")
-        except Exception:
-            pass
-
-        already_709 = (
-            current_color_space and "709" in str(current_color_space)
-            and current_gamma and "709" in str(current_gamma)
-        )
-        if already_709:
-            print(f"  [skip]   {name}: already Rec.709 ({current_color_space} / {current_gamma})")
-            skipped += 1
-            continue
-
-        if args.dry_run:
-            print(f"  [would fix] {name}: {current_color_space} / {current_gamma} -> Rec.709")
-            continue
-
-        try:
-            # Ensure per-clip RAW settings (rather than the project default)
-            # are what actually gets applied to this clip.
-            clip.SetClipProperty("Decode Using", "Clip")
-        except Exception:
-            pass
-
-        applied_cs = set_property_with_fallback(clip, "Color Space", color_space_candidates)
-        applied_gamma = set_property_with_fallback(clip, "Gamma", gamma_candidates)
-
-        if applied_cs and applied_gamma:
-            print(f"  [fixed]  {name}: -> Color Space={applied_cs}, Gamma={applied_gamma}")
-            updated += 1
-        else:
-            print(
-                f"  [FAILED] {name}: could not confirm Rec.709 RAW decode "
-                f"(Color Space={applied_cs}, Gamma={applied_gamma}). "
-                f"Run with --debug to inspect this clip's property names/values."
-            )
-            failed += 1
+            if ok:
+                print(f"  [applied] {clip_name}: CST node graph applied from {os.path.basename(drx_path)}")
+                applied += 1
+            else:
+                print(f"  [FAILED] {clip_name}: ApplyGradeFromDRX returned False")
+                failed += 1
 
     print("\nSummary:")
-    print(f"  updated: {updated}")
-    print(f"  already Rec.709: {skipped}")
-    print(f"  failed:  {failed}")
-    if failed:
-        print(
-            "\nSome clips could not be confirmed as fixed. RAW decode "
-            "property names can vary by Resolve version -- run with --debug "
-            "to dump the exact GetClipProperty() keys/values for a ZRAW clip "
-            "and adjust REC709_COLOR_SPACE_CANDIDATES / "
-            "REC709_GAMMA_CANDIDATES at the top of this script accordingly."
-        )
+    print(f"  timeline clips scanned: {total_items}")
+    print(f"  ZRAW clips found:       {zraw_items}")
+    if args.dry_run:
+        print("  (dry run -- nothing was changed)")
+    else:
+        print(f"  grade applied:          {applied}")
+        print(f"  failed:                 {failed}")
+        if applied:
+            print(
+                "\nOpen the Color page on any updated clip to see the new "
+                "Color Space Transform node -- it's a normal node you can "
+                "click, tweak, or remove, and nothing on the source ZRAW "
+                "file or its clip metadata was modified."
+            )
 
 
 if __name__ == "__main__":
