@@ -70,6 +70,15 @@ USAGE
   python3 zraw_to_rec709.py --all-timelines
   python3 zraw_to_rec709.py --dry-run
   python3 zraw_to_rec709.py --lut ~/ZCAM_ZLog2_to_Rec709.cube
+  python3 zraw_to_rec709.py --all-clips            # if Resolve exposes no
+                                                     # camera/Log2 metadata
+                                                     # for your footage (check
+                                                     # via --debug) and the
+                                                     # timeline is entirely
+                                                     # this camera's clips
+  python3 zraw_to_rec709.py --all-clips --path-contains "DCIM\A0"  # scope by
+                                                     # folder on a mixed-
+                                                     # camera timeline
   python3 zraw_to_rec709.py --debug                # dump properties of the
                                                      # first ZRAW clip found,
                                                      # to check/adjust the
@@ -258,6 +267,21 @@ def main():
         help="Process every timeline in the project instead of just the current one.",
     )
     parser.add_argument(
+        "--all-clips", action="store_true",
+        help="Skip content-based detection and treat every video clip on the "
+             "timeline(s) as a match. Use this when Resolve exposes no "
+             "camera/Log2 metadata for your footage (common for Z CAM H.265 "
+             "MOV files -- check with --debug/the console property dump) and "
+             "you know the timeline is entirely (or specifically) this camera's "
+             "footage.",
+    )
+    parser.add_argument(
+        "--path-contains", default=None,
+        help="Only match clips whose File Path contains this substring "
+             "(case-insensitive). Combine with --all-clips to scope a mixed-"
+             "camera timeline by folder, e.g. --path-contains \"DCIM\\\\A0\".",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Report which clips would be changed without changing anything.",
     )
@@ -323,7 +347,18 @@ def main():
         for item in iter_video_timeline_items(timeline):
             total_items += 1
             media_pool_item = item.GetMediaPoolItem()
-            if not is_zraw_clip(media_pool_item):
+
+            if args.path_contains:
+                file_path = ""
+                if media_pool_item is not None:
+                    try:
+                        file_path = str(media_pool_item.GetClipProperty("File Path") or "")
+                    except Exception:
+                        file_path = ""
+                if args.path_contains.lower() not in file_path.lower():
+                    continue
+
+            if not args.all_clips and not is_zraw_clip(media_pool_item):
                 continue
 
             zraw_items += 1
