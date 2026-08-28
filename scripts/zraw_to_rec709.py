@@ -2,12 +2,15 @@
 """
 zraw_to_rec709.py
 
-DaVinci Resolve Studio 20 script that normalises every Z CAM ZRAW clip on
-the current timeline to Rec.709, fully automatically -- no per-clip work
-in the Color page, no pre-built grade to apply by hand. Run it, and every
-ZRAW clip on the timeline comes out Rec.709-normalised, ready for further
-colour grading. The source ZRAW media file and its Camera Raw / RAW decode
-metadata are never touched.
+DaVinci Resolve Studio 20 script that normalises every Z CAM clip shot in
+Z-Log2 on the current timeline to Rec.709, fully automatically -- no
+per-clip work in the Color page, no pre-built grade to apply by hand. This
+covers both raw ZRAW footage and Z-Log2 baked into a conventional codec
+(e.g. H.265/HEVC .MOV, which is what many Z CAM cameras record by default
+-- the codec changes, the Z-Log2 colour science underneath doesn't). Run
+it, and every matching clip on the timeline comes out Rec.709-normalised,
+ready for further colour grading. The source media file and its metadata
+are never touched.
 
 WHY TWO MODES
 -------------
@@ -113,6 +116,15 @@ def get_resolve():
 
 ZRAW_EXTENSIONS = (".zraw",)
 ZRAW_MARKERS = ("zraw", "z-raw", "z cam", "zcam")
+# Checked only against real metadata fields (Camera Type/Codec/Format/Gamma/
+# Color Space), never filenames -- catches Z CAM's Z-Log2 gamma even when
+# it's wrapped in a conventional codec (e.g. H.265/HEVC MOV, which is what
+# many Z CAM cameras record by default) rather than shot as raw ZRAW. Same
+# colour science, just not raw sensor data, so the same fix applies. A bare
+# "log2" is deliberately NOT checked against filenames -- too easy to false-
+# match an unrelated file that happens to contain that substring.
+LOG2_MARKERS = ("zlog2", "z log2", "z-log2", "log2")
+METADATA_ONLY_PROPS = ["Camera Type", "Codec", "Format", "Gamma", "Color Space", "Input Color Space"]
 
 # Candidate strings for the RCM "Input Color Space" tag on a Z CAM ZRAW
 # clip. Exact wording has varied across Resolve releases -- each is tried
@@ -129,12 +141,16 @@ INPUT_COLOR_SPACE_CANDIDATES = [
 
 
 def is_zraw_clip(media_pool_item):
-    """Best-effort, read-only detection of a Z CAM ZRAW source clip.
+    """Best-effort, read-only detection of Z CAM footage shot in Z-Log2 --
+    whether it's raw ZRAW or Z-Log2 baked into a conventional codec (e.g.
+    H.265/HEVC .MOV, which is what many Z CAM cameras record by default).
     Only reads clip properties -- never writes anything."""
     if media_pool_item is None:
         return False
-    props_to_check = ["Camera Type", "Codec", "Format", "File Name", "Clip Name"]
-    for prop in props_to_check:
+
+    # Filename/clip name: only the unambiguous ZRAW/Z CAM markers, plus the
+    # .zraw extension.
+    for prop in ("File Name", "Clip Name"):
         try:
             value = media_pool_item.GetClipProperty(prop)
         except Exception:
@@ -146,6 +162,22 @@ def is_zraw_clip(media_pool_item):
             return True
         if any(text.endswith(ext) for ext in ZRAW_EXTENSIONS):
             return True
+
+    # Real metadata fields: also check for a Z-Log2 gamma/colour space tag,
+    # which is how Z-Log2-in-H.265 footage (not raw) shows up.
+    for prop in METADATA_ONLY_PROPS:
+        try:
+            value = media_pool_item.GetClipProperty(prop)
+        except Exception:
+            continue
+        if not value:
+            continue
+        text = str(value).lower()
+        if any(marker in text for marker in ZRAW_MARKERS):
+            return True
+        if any(marker in text for marker in LOG2_MARKERS):
+            return True
+
     return False
 
 
