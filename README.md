@@ -2,17 +2,20 @@
 
 ## DaVinci Resolve scripts
 
-`scripts/zraw_to_rec709.py` — normalises Z CAM ZRAW footage to Rec.709
-inside DaVinci Resolve Studio 20 using a real **Color Space Transform (CST)
-node** in the Color page, not by rewriting the clip's RAW decode metadata.
+`scripts/zraw_to_rec709.py` — run it once and every Z CAM ZRAW clip on the
+current timeline (or every timeline, with `--all-timelines`) comes out
+normalised to Rec.709, ready for further colour grading. No manual Color
+page work required. The source ZRAW file and its Camera Raw/RAW decode
+metadata are never touched.
 
-Nothing on the source ZRAW file or the Media Pool clip's Camera Raw
-settings is touched. The script batch-applies a Color Space Transform
-node graph (built once by hand and exported as a `.drx`) to every Z CAM
-ZRAW clip on the timeline via `TimelineItem.ApplyGradeFromDRX()`, so the
-result is a normal, visible, editable node — same as if you'd dragged a
-PowerGrade onto each clip yourself.
+Two modes:
+- **RCM mode (default)** — tags each ZRAW clip's Resolve Color Management
+  "Input Color Space", so Resolve's own colour engine inserts the correct
+  transform automatically before Node 1. Requires Color Management to be
+  enabled in Project Settings (the script checks and tells you if it isn't).
+- **`--lut PATH` mode** — applies a 3D LUT (e.g. Z CAM's official Z-Log2 ->
+  Rec.709 technical LUT) directly to Node 1 of every ZRAW clip. Works
+  without Color Management enabled.
 
-See the docstring at the top of the script for the one-time setup (build
-the CST node + export the `.drx`) and usage (`--dry-run`,
-`--all-timelines`, etc.).
+See the docstring at the top of the script for full details and other
+flags (`--dry-run`, `--debug`, `--input-color-space`).

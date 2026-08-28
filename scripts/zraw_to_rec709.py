@@ -2,64 +2,51 @@
 """
 zraw_to_rec709.py
 
-DaVinci Resolve Studio 20 script that normalises Z CAM ZRAW footage to
-Rec.709 using a real Color Space Transform (CST) node in the Color page --
-NOT by rewriting RAW decode metadata on the clip or file.
+DaVinci Resolve Studio 20 script that normalises every Z CAM ZRAW clip on
+the current timeline to Rec.709, fully automatically -- no per-clip work
+in the Color page, no pre-built grade to apply by hand. Run it, and every
+ZRAW clip on the timeline comes out Rec.709-normalised, ready for further
+colour grading. The source ZRAW media file and its Camera Raw / RAW decode
+metadata are never touched.
 
-This is fully non-destructive:
-  * The original ZRAW media file on disk is never touched.
-  * The Media Pool clip's RAW decode settings (Camera Raw tab / Color Space
-    / Gamma properties) are left exactly as they are.
-  * The only thing that changes is the per-timeline-instance node graph in
-    the Color page: a Color Space Transform node (Input: Z CAM's native
-    space, Output: Rec.709) is inserted, exactly as if you had built it by
-    hand with the CST OFX. It shows up as a normal, clickable, editable node
-    -- you can tweak it, disable it, or delete it per clip like any other
-    grade.
+WHY TWO MODES
+-------------
+The Resolve scripting API has no call to insert an arbitrary OFX filter
+(such as the Color Space Transform effect) into a clip's node graph, so
+"the script builds a brand-new CST node from nothing" isn't something the
+API supports. What IS supported, and used here, are two genuinely automatic,
+non-destructive ways to get the same *result* -- clips normalised to
+Rec.709 via a real transform, not a metadata rewrite:
 
-WHY A TWO-STEP WORKFLOW
-------------------------
-The Resolve scripting API does not expose "add a Color Space Transform OFX
-to this node" as a callable. What it DOES expose is
-TimelineItem.ApplyGradeFromDRX(), which applies a previously saved grade
-(a .drx file) onto a timeline clip's node graph. So the workflow is:
+  1. RCM mode (default) -- tags each ZRAW clip's "Input Color Space" (a
+     Resolve Color Management property stored in the project database, not
+     in the file). With Color Management enabled and the timeline/output
+     colour space set to Rec.709, Resolve's own colour engine automatically
+     inserts the correct transform for every clip before Node 1, using
+     Blackmagic's calibrated Z CAM colour science. This is the standard,
+     professional way to batch-normalise camera-native footage for editors/
+     grading and needs zero manual Color page work per clip.
 
-  STEP 1 (one-time, done by hand in Resolve):
-    1. Put one Z CAM ZRAW clip on a timeline and open the Color page.
-    2. On Node 1, add a Color Space Transform (Effects Library > OpenFX >
-       ResolveFX Color > Color Space Transform, or right-click the node >
-       Add Node > ... in older versions it's under the same OFX list).
-    3. Set the CST's:
-         Input Color Space / Gamma  -> whatever entry matches your camera,
-                                        e.g. "Z CAM ZRAW Wide Gamut" /
-                                        "Z Log2" (check the exact wording
-                                        in the dropdown against the "Color
-                                        Space" / "Gamma" fields shown in
-                                        that clip's Camera Raw tab under
-                                        Clip Attributes, so the CST input
-                                        matches how the clip is actually
-                                        being decoded).
-         Output Color Space / Gamma -> "Rec.709" / "Rec.709" (or "Rec.709
-                                        Gamma 2.4", matching your timeline
-                                        colour space).
-    4. With that clip selected, grab a still (right-click the thumbnail
-       timeline at the top of the Color page > "Grab Still", or press the
-       grab-still button). This adds a still to the Gallery.
-    5. In the Gallery, right-click that still > Export... and save it as a
-       .drx file somewhere on disk, e.g. ~/zraw_to_rec709.drx.
+     Prerequisite: Color Management must be ON for the project (Project
+     Settings > Color Management > Color science = "DaVinci YRGB Color
+     Managed"). This is a one-time, project-wide setting -- the script
+     checks it and tells you plainly if it's off rather than flipping a
+     project-wide pipeline setting behind your back (that could disrupt
+     other, unrelated clips/grades already in the project).
 
-  STEP 2 (this script, repeatable):
-    Run this script with --drx pointing at that .drx file. It walks the
-    current timeline (or every timeline with --all-timelines), finds every
-    clip whose source media is Z CAM ZRAW, and calls
-    ApplyGradeFromDRX() on each one -- so every ZRAW clip gets the same CST
-    node graph applied, in one pass, without you dragging a PowerGrade onto
-    each clip by hand.
+  2. LUT mode (--lut PATH) -- applies a 3D LUT directly to Node 1 of every
+     ZRAW clip's node graph via the documented Graph.SetLUT() call. This
+     produces a literal, visible "node with a transform on it" per clip,
+     works regardless of whether Color Management is on, and needs no
+     project-wide setting change. Use Z CAM's own official Z-Log2 ->
+     Rec.709 technical LUT for this (published by Z CAM for exactly this
+     purpose) -- this script does not fabricate a LUT itself, since an
+     incorrect transfer-function/matrix guess would bake in wrong colour.
 
-NOTE: ApplyGradeFromDRX() applies the *entire* saved node graph from the
-.drx, replacing whatever grade is currently on that clip instance. Run this
-early in your workflow (before secondary grading), or keep the source .drx
-to just the single CST node so there's nothing else to clobber.
+Both modes touch nothing on disk and nothing on the source clip's RAW
+decode settings -- only the Color page's per-clip Input Color Space tag
+(mode 1) or Node 1's LUT (mode 2), both fully visible and removable from
+Resolve's UI at any time.
 
 INSTALLATION
 ------------
@@ -71,15 +58,23 @@ Workspace > Scripts:
   Linux:   ~/.local/share/DaVinciResolve/Fusion/Scripts/Utility/
 
 Then run it from Workspace > Scripts > zraw_to_rec709, or as an external
-script (python3 zraw_to_rec709.py --drx /path/to/grade.drx) with Resolve
-open and External Scripting enabled (Preferences > System > General).
+script with Resolve open and External Scripting enabled (Preferences >
+System > General).
 
 USAGE
 -----
-  python3 zraw_to_rec709.py --drx ~/zraw_to_rec709.drx
-  python3 zraw_to_rec709.py --drx ~/zraw_to_rec709.drx --dry-run
-  python3 zraw_to_rec709.py --drx ~/zraw_to_rec709.drx --all-timelines
-  python3 zraw_to_rec709.py --drx ~/zraw_to_rec709.drx --grade-mode source-tc
+  python3 zraw_to_rec709.py                       # RCM mode, current timeline
+  python3 zraw_to_rec709.py --all-timelines
+  python3 zraw_to_rec709.py --dry-run
+  python3 zraw_to_rec709.py --lut ~/ZCAM_ZLog2_to_Rec709.cube
+  python3 zraw_to_rec709.py --debug                # dump properties of the
+                                                     # first ZRAW clip found,
+                                                     # to check/adjust the
+                                                     # Input Color Space
+                                                     # candidate strings below
+                                                     # if the defaults don't
+                                                     # match your Resolve
+                                                     # version
 """
 
 import argparse
@@ -116,15 +111,21 @@ def get_resolve():
         ) from exc
 
 
-# gradeMode values accepted by TimelineItem.ApplyGradeFromDRX()
-GRADE_MODES = {
-    "no-keyframes": 0,
-    "source-tc": 1,
-    "start-frames": 2,
-}
-
 ZRAW_EXTENSIONS = (".zraw",)
 ZRAW_MARKERS = ("zraw", "z-raw", "z cam", "zcam")
+
+# Candidate strings for the RCM "Input Color Space" tag on a Z CAM ZRAW
+# clip. Exact wording has varied across Resolve releases -- each is tried
+# in order and verified by reading the property back; use --input-color-space
+# to override outright, or --debug to see the exact current value/options
+# on your build.
+INPUT_COLOR_SPACE_CANDIDATES = [
+    "Z CAM ZRAW Wide Gamut",
+    "ZRAW Wide Gamut",
+    "Z CAM Z-Log2",
+    "Z Log2",
+    "ZLog2",
+]
 
 
 def is_zraw_clip(media_pool_item):
@@ -149,7 +150,6 @@ def is_zraw_clip(media_pool_item):
 
 
 def iter_video_timeline_items(timeline):
-    """Yield every video-track TimelineItem on a timeline."""
     track_count = timeline.GetTrackCount("video")
     for track_index in range(1, track_count + 1):
         for item in timeline.GetItemListInTrack("video", track_index):
@@ -167,34 +167,80 @@ def get_timelines(project, all_timelines):
     return [current]
 
 
+def color_management_enabled(project):
+    """Best-effort check of whether RCM (Color Management) is on for this
+    project. Returns True/False/None (None = could not determine)."""
+    try:
+        mode = project.GetSetting("colorScienceMode")
+    except Exception:
+        return None
+    if not mode:
+        return None
+    return "colormanaged" in str(mode).replace(" ", "").lower()
+
+
+def dump_clip_properties(media_pool_item):
+    print("\n--- Clip property dump (for adjusting this script) ---")
+    try:
+        props = media_pool_item.GetClipProperty()
+        for key in sorted(props.keys()):
+            print(f"  {key!r}: {props[key]!r}")
+    except Exception as exc:
+        print(f"  Could not enumerate properties: {exc}")
+    print("--- end dump ---\n")
+
+
+def set_property_with_fallback(media_pool_item, prop_name, candidates):
+    for value in candidates:
+        try:
+            media_pool_item.SetClipProperty(prop_name, value)
+        except Exception:
+            continue
+        try:
+            applied = media_pool_item.GetClipProperty(prop_name)
+        except Exception:
+            applied = None
+        if applied and str(applied).strip().lower() == str(value).strip().lower():
+            return applied
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--drx", required=True,
-        help="Path to the .drx grade (Node 1 = Color Space Transform to Rec.709) "
-             "exported from the Gallery, per the STEP 1 instructions above.",
+        "--lut", default=None,
+        help="Path to a Z-Log2/ZRAW-Wide-Gamut -> Rec.709 3D LUT (.cube). "
+             "If given, applies it directly to Node 1 of every ZRAW clip "
+             "instead of using RCM Input Color Space tagging.",
+    )
+    parser.add_argument(
+        "--input-color-space", default=None,
+        help="Override the RCM 'Input Color Space' value to tag ZRAW clips "
+             "with (RCM mode only). Use --debug to see the exact string your "
+             "Resolve build expects if the built-in candidates don't stick.",
     )
     parser.add_argument(
         "--all-timelines", action="store_true",
-        help="Apply to every timeline in the project instead of just the current one.",
-    )
-    parser.add_argument(
-        "--grade-mode", choices=sorted(GRADE_MODES), default="no-keyframes",
-        help="Alignment mode passed to ApplyGradeFromDRX (default: no-keyframes).",
+        help="Process every timeline in the project instead of just the current one.",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Report which timeline clips would be graded without changing anything.",
+        help="Report which clips would be changed without changing anything.",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Print all clip properties for the first ZRAW clip found, then continue.",
     )
     args = parser.parse_args()
 
-    drx_path = os.path.abspath(os.path.expanduser(args.drx))
-    if not os.path.isfile(drx_path):
-        print(f"ERROR: .drx file not found: {drx_path}")
-        print("Complete STEP 1 in this script's docstring first, or check --drx.")
-        sys.exit(1)
+    lut_path = None
+    if args.lut:
+        lut_path = os.path.abspath(os.path.expanduser(args.lut))
+        if not os.path.isfile(lut_path):
+            print(f"ERROR: LUT file not found: {lut_path}")
+            sys.exit(1)
 
     resolve = get_resolve()
     project_manager = resolve.GetProjectManager()
@@ -203,17 +249,42 @@ def main():
         print("No project is currently open in Resolve. Open a project and try again.")
         sys.exit(1)
 
+    if lut_path is None:
+        rcm_on = color_management_enabled(project)
+        if rcm_on is False:
+            print(
+                "Color Management is OFF for this project. RCM mode needs it on "
+                "to insert the automatic Input Color Space -> timeline transform.\n"
+                "Enable it once via Project Settings > Color Management > "
+                "Color science = 'DaVinci YRGB Color Managed' (and set Timeline/"
+                "Output Color Space to Rec.709 there), then re-run this script.\n"
+                "Alternatively, run with --lut PATH to apply a LUT directly to "
+                "Node 1 instead, which works without Color Management."
+            )
+            sys.exit(1)
+        elif rcm_on is None:
+            print(
+                "Could not confirm Color Management is enabled from the API -- "
+                "proceeding, but if nothing changes, check Project Settings > "
+                "Color Management yourself, or use --lut instead.\n"
+            )
+
     timelines = get_timelines(project, args.all_timelines)
     if not timelines:
         print("No timeline found (open/create a timeline with your ZRAW clips cut in).")
         sys.exit(1)
 
-    grade_mode = GRADE_MODES[args.grade_mode]
+    input_cs_candidates = (
+        [args.input_color_space] if args.input_color_space else INPUT_COLOR_SPACE_CANDIDATES
+    )
 
     total_items = 0
     zraw_items = 0
-    applied = 0
+    updated = 0
+    skipped = 0
     failed = 0
+    debugged = False
+    tagged_source_clips = set()  # avoid re-tagging the same source clip twice in RCM mode
 
     for timeline in timelines:
         print(f"Timeline: {timeline.GetName()}")
@@ -226,22 +297,46 @@ def main():
             zraw_items += 1
             clip_name = item.GetName()
 
+            if args.debug and not debugged:
+                dump_clip_properties(media_pool_item)
+                debugged = True
+
             if args.dry_run:
-                print(f"  [would apply CST] {clip_name}")
+                print(f"  [would fix] {clip_name}")
                 continue
 
-            try:
-                ok = item.ApplyGradeFromDRX(drx_path, grade_mode)
-            except Exception as exc:
-                print(f"  [FAILED] {clip_name}: exception applying grade ({exc})")
-                failed += 1
+            if lut_path is not None:
+                try:
+                    graph = item.GetNodeGraph()
+                    ok = graph.SetLUT(1, lut_path)
+                except Exception as exc:
+                    print(f"  [FAILED] {clip_name}: exception applying LUT ({exc})")
+                    failed += 1
+                    continue
+                if ok:
+                    print(f"  [fixed]  {clip_name}: LUT applied to Node 1 ({os.path.basename(lut_path)})")
+                    updated += 1
+                else:
+                    print(f"  [FAILED] {clip_name}: SetLUT returned False")
+                    failed += 1
                 continue
 
-            if ok:
-                print(f"  [applied] {clip_name}: CST node graph applied from {os.path.basename(drx_path)}")
-                applied += 1
+            # RCM mode: tag the underlying source clip once.
+            clip_id = media_pool_item.GetClipProperty("File Path") or media_pool_item.GetClipProperty("Clip Name")
+            if clip_id in tagged_source_clips:
+                skipped += 1
+                continue
+
+            applied = set_property_with_fallback(media_pool_item, "Input Color Space", input_cs_candidates)
+            if applied:
+                print(f"  [fixed]  {clip_name}: Input Color Space -> {applied}")
+                updated += 1
+                tagged_source_clips.add(clip_id)
             else:
-                print(f"  [FAILED] {clip_name}: ApplyGradeFromDRX returned False")
+                print(
+                    f"  [FAILED] {clip_name}: could not confirm Input Color Space tag. "
+                    f"Run with --debug or pass --input-color-space explicitly."
+                )
                 failed += 1
 
     print("\nSummary:")
@@ -250,14 +345,15 @@ def main():
     if args.dry_run:
         print("  (dry run -- nothing was changed)")
     else:
-        print(f"  grade applied:          {applied}")
+        print(f"  fixed:                  {updated}")
+        print(f"  skipped (already done): {skipped}")
         print(f"  failed:                 {failed}")
-        if applied:
+        if failed:
             print(
-                "\nOpen the Color page on any updated clip to see the new "
-                "Color Space Transform node -- it's a normal node you can "
-                "click, tweak, or remove, and nothing on the source ZRAW "
-                "file or its clip metadata was modified."
+                "\nSome clips could not be confirmed. Run with --debug to inspect "
+                "GetClipProperty() output for a ZRAW clip and adjust "
+                "INPUT_COLOR_SPACE_CANDIDATES at the top of this script, or pass "
+                "--input-color-space / --lut explicitly."
             )
 
 
